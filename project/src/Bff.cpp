@@ -545,6 +545,156 @@ bool BFF::flattenToShape(const std::vector<Vector>& gamma)
 	return true;
 }
 
+
+// Use the Mobius centering algorithm described in Baden et al 2018
+// (https://www.cs.cmu.edu/~kmcrane/Projects/MobiusRegistration/paper.pdf) to
+// find better positions
+// Input is the vertex dual areas of the original mesh
+void BFF::mobiusCenter(VertexData<double> area) {
+
+  // Normalize surface to have surface area 1
+  double totalArea = 0;
+  for (VertexIter v = mesh.vertices.begin(); v != mesh.vertices.end(); v++) {
+	totalArea += area[v];
+  }
+  for (VertexIter v = mesh.vertices.begin(); v != mesh.vertices.end(); v++) {
+	area[v] /= totalArea;
+  }
+
+  Vector centerOfMass;
+  VertexData<Vector> centeredPositions(mesh);
+  for (VertexIter v = mesh.vertices.begin(); v != mesh.vertices.end(); v++) {
+	centeredPositions[v] = v->halfEdge()->next()->wedge()->uv;
+  }
+
+  auto evalStep = [&](Vector c) {
+	Vector newCenter{0, 0, 0};
+	for (VertexIter v = mesh.vertices.begin(); v != mesh.vertices.end(); v++) {
+	  Vector p = centeredPositions[v];
+	  Vector newP = (1 - c.norm2()) * (p + c) / (p + c).norm2() + c;
+	  newCenter += area[v] * newP;
+	}
+	return newCenter.norm();
+  };
+  auto takeStep = [&](Vector c) {
+	Vector newCenter{0, 0, 0};
+	for (VertexIter v = mesh.vertices.begin(); v != mesh.vertices.end(); v++) {
+	  Vector p = centeredPositions[v];
+	  centeredPositions[v] = (1 - c.norm2()) * (p + c) / (p + c).norm2() + c;
+	  newCenter += area[v] * centeredPositions[v];
+	}
+	return newCenter;
+  };
+
+  auto times = [](DenseMatrix M, Vector v) {
+	return Vector{M(0, 0) * v.x + M(0, 1) * v.y + M(0, 2) * v.z,
+				  M(1, 0) * v.x + M(1, 1) * v.y + M(1, 2) * v.z,
+				  M(2, 0) * v.x + M(2, 1) * v.y + M(2, 2) * v.z};
+  };
+
+  // Returns vv^T
+  auto outer = [](Vector v) {
+	DenseMatrix M(3, 3);
+	for (size_t i = 0; i < 3; ++i) {
+	  for (size_t j = 0; j < 3; ++j) {
+		M(i, j) = v[i] * v[j];
+	  }
+	}
+	return M;
+  };
+
+  // Inverse of a 3x3 matrix
+  auto inverse = [](DenseMatrix M) {
+	double det = M(0, 0) * M(1, 1) * M(2, 2) - M(0, 0) * M(1, 2) * M(2, 1) -
+				 M(0, 1) * M(1, 0) * M(2, 2) + M(0, 1) * M(1, 2) * M(2, 0) +
+				 M(0, 2) * M(1, 0) * M(2, 1) - M(0, 2) * M(1, 1) * M(2, 0);
+
+	DenseMatrix cofactors(3, 3);
+	cofactors(0, 0) = (M(1, 1) * M(2, 2) - M(2, 1) * M(1, 2));
+	cofactors(0, 1) = (M(1, 2) * M(2, 0) - M(1, 0) * M(2, 2));
+	cofactors(0, 2) = (M(1, 0) * M(2, 1) - M(2, 0) * M(1, 1));
+	cofactors(1, 0) = (M(0, 2) * M(2, 1) - M(0, 1) * M(2, 2));
+	cofactors(1, 1) = (M(0, 0) * M(2, 2) - M(0, 2) * M(2, 0));
+	cofactors(1, 2) = (M(2, 0) * M(0, 1) - M(0, 0) * M(2, 1));
+	cofactors(2, 0) = (M(0, 1) * M(1, 2) - M(0, 2) * M(1, 1));
+	cofactors(2, 1) = (M(1, 0) * M(0, 2) - M(0, 0) * M(1, 2));
+	cofactors(2, 2) = (M(0, 0) * M(1, 1) - M(1, 0) * M(0, 1));
+
+	return cofactors.transpose() * (1 / det);
+  };
+
+  centerOfMass = takeStep(Vector{0, 0, 0});
+  double stepSize = 1;
+  while (centerOfMass.norm() > 1e-3) {
+	DenseMatrix J = DenseMatrix(3, 3);
+	DenseMatrix I = DenseMatrix::identity(3, 3);
+
+	if (J.nRows() != 3 || J.nCols() != 3) {
+	  std::cout << "J has size " << J.nRows() << "x" << J.nCols() << std::endl;
+	  exit(1);
+	}
+
+	for (VertexIter v = mesh.vertices.begin(); v != mesh.vertices.end(); v++) {
+	  Vector p = centeredPositions[v];
+	  J += (I - outer(p)) * 2 * area[v];
+	}
+
+	Vector step = times(inverse(J) * -1, centerOfMass);
+
+	double oldObjective = centerOfMass.norm();
+
+	// Use Golden-section line search to pick a step size
+	// https://en.wikipedia.org/wiki/Golden-section_search
+	double invphi = 0.5 * (sqrt(5.) - 1);  // 1/phi
+	double invphi2 = 0.5 * (3 - sqrt(5.)); // 1/phi^2
+	double a = 0;
+	double b = 1;
+
+	double h = b - a;
+	double c = a + invphi2 * h;
+	double d = a + invphi * h;
+	double fc = evalStep(c * step);
+	double fd = evalStep(d * step);
+
+	while (abs(c - d) > 1e-8) {
+	  if (fc < fd) {
+		b = d;
+		d = c;
+		fd = fc;
+		h = invphi * h;
+		c = a + invphi2 * h;
+		fc = evalStep(c * step);
+	  } else {
+		a = c;
+		c = d;
+		fc = fd;
+		h = invphi * h;
+		d = a + invphi * h;
+		fd = evalStep(d * step);
+	  }
+	}
+	double stepSize;
+	if (fc < fd) {
+	  stepSize = (a + d) / 2;
+	} else {
+	  stepSize = (c + b) / 2;
+	}
+
+	centerOfMass = takeStep(stepSize * step);
+  }
+
+  for (VertexIter v = mesh.vertices.begin(); v != mesh.vertices.end(); v++) {
+	// set uv coordinates
+	HalfEdgeIter he = v->halfEdge();
+	do {
+	  he->next()->wedge()->uv = centeredPositions[v];
+
+	  he = he->flip()->next();
+	} while (he != v->halfEdge());
+  }
+}
+
+
 void BFF::projectStereographically(VertexCIter pole, double radius,
 								   const VertexData<Vector>& uvs)
 {
@@ -570,6 +720,20 @@ void BFF::projectStereographically(VertexCIter pole, double radius,
 
 bool BFF::mapToSphere()
 {
+
+	// Compute dual areas to use in Mobius centering later
+	VertexData<double> dualAreas(mesh);
+	for (VertexIter v = mesh.vertices.begin(); v != mesh.vertices.end(); v++) {
+		dualAreas[v] = 0;
+		// set uv coordinates
+		HalfEdgeIter he = v->halfEdge();
+		do {
+			dualAreas[v] += he->face()->area() / 3.0;
+			he = he->flip()->next();
+		} while (he != v->halfEdge());
+	}
+
+
 	// remove an arbitrary vertex star
 	VertexIter pole;
 	for (VertexIter v = mesh.vertices.begin(); v != mesh.vertices.end(); v++) {
@@ -645,6 +809,8 @@ bool BFF::mapToSphere()
 
 		he = he->flip()->next();
 	} while (he != pole->halfEdge());
+
+	mobiusCenter(dualAreas);
 
 	// reset current data to the data of the input surface
 	data = inputSurfaceData;

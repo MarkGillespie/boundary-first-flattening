@@ -109,6 +109,12 @@ protected:
 	void projectStereographically(VertexCIter pole, double radius,
 								  const VertexData<Vector>& uvs);
 
+	// Use the Mobius centering algorithm described in Baden et al 2018
+	// (https://www.cs.cmu.edu/~kmcrane/Projects/MobiusRegistration/paper.pdf) to
+	// find better positions
+	// Input is the vertex dual areas of the original mesh
+	void mobiusCenter(VertexData<double> area);
+
 	// members
 	Mesh& mesh;
 	double meanScaling;
